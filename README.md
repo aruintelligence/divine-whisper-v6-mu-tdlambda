@@ -1,3 +1,6 @@
+> [!NOTE]
+> **Divine Whisper lineage repository.** This is a preserved experimental stage or supporting component. Start with the [canonical ecosystem index](https://github.com/aruintelligence/divine-whisper-ecosystem) for the complete version map, current context, and research-scope notice.
+
 # Divine Whisper v6 – Multimodal μ-Field + TD-λ Orchestrator
 
 **First runnable prototype of explicit memory field μ(x,t) + temporal-difference (λ) learning under Inward Physics**
