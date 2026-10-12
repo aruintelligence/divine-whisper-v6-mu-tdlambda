@@ -1,203 +1,314 @@
-"""
-Divine Whisper v6 – Multimodal μ-Field + TD-λ Orchestrator
-----------------------------------------------------------
-First runnable prototype with:
-• Explicit μ(x,t) memory field (vector + coherence)
-• TD-λ updates with eligibility traces
-• Multimodal input (text + synthetic sensory vectors)
-• Phase-aware adaptation (NOISE → BREAKTHROUGH)
-• Remiel node with weak TD corrections
-• Heaven Ledger + coherence trajectory export
-• Smoke-test + CLI entry point
+"""Reproducible toy μ-field simulation and a genuine linear TD(λ) experiment.
 
-Copyright (c) 2026 Daniel Jacob Read IV & Shane Travis Horman – ĀRU Intelligence
-MIT License – fork & extend freely
+The μ-field, "clarity", and recommendation policy are synthetic proxies. Only
+the delayed-reward benchmark has a known target value function.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
-import random
-import time
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ────────────────────────────────────────────────────────────────────────────────
 
-def new_id(prefix: str = "id") -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+def clamp(value: float) -> float:
+    return max(0.0, min(1.0, value))
 
-def now_ms() -> float:
-    return time.time() * 1000.0
-
-def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, x))
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Core μ-Field & Clarity (stabilized from v5.1)
-# ────────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class MuField:
-    """Persistent memory field μ(x,t) – vector + coherence score."""
+    """Stateful vector with an inverse-entropy concentration proxy."""
+
     vector: np.ndarray
     coherence: float = 0.0
-    last_update: float = field(default_factory=time.time)
+    entropy: float = 0.0
 
-    @staticmethod
-    def new(dim: int = 256) -> "MuField":
-        return MuField(vector=np.zeros(dim, dtype=np.float32))
+    @classmethod
+    def new(cls, dim: int = 256) -> MuField:
+        if dim < 2:
+            raise ValueError("dim must be at least 2")
+        return cls(np.zeros(dim, dtype=np.float64), entropy=math.log(dim))
 
-    def update_td_lambda(self, delta: np.ndarray, lambda_: float = 0.95, alpha: float = 0.01):
-        """TD(λ) update with eligibility trace approximation."""
+    def update(self, delta: np.ndarray, alpha: float) -> None:
+        delta = np.asarray(delta, dtype=np.float64)
+        if delta.shape != self.vector.shape or not np.all(np.isfinite(delta)):
+            raise ValueError("delta must be finite and match the field shape")
+        if not 0 <= alpha <= 1:
+            raise ValueError("alpha must be in [0, 1]")
         self.vector += alpha * delta
-        self.vector /= np.linalg.norm(self.vector) + 1e-6
+        norm = np.linalg.norm(self.vector)
+        if norm > 0:
+            self.vector /= norm
+        probabilities = np.abs(self.vector) + 1e-12
+        probabilities /= probabilities.sum()
+        self.entropy = float(-np.sum(probabilities * np.log(probabilities)))
+        self.coherence = clamp(1.0 - self.entropy / math.log(self.vector.size))
 
-        # Simple coherence proxy (inverse normalized entropy)
-        probs = np.abs(self.vector) + 1e-6
-        probs /= probs.sum()
-        entropy = -np.sum(probs * np.log(probs + 1e-9))
-        max_entropy = math.log(len(probs))
-        self.coherence = clamp(1.0 - (entropy / max_entropy))
 
-        self.last_update = time.time()
+@dataclass
+class TDLambdaValue:
+    """Online linear TD(λ) with accumulating eligibility traces.
 
-def clarity(mu: MuField, distortion: float, friction: float, eps: float = 1e-6) -> float:
-    raw = mu.coherence / ((distortion + eps) ** 2 * (friction + eps))
+    δ = r + γ V(next) - V(current), with V(terminal) = 0.
+    e = γ λ e + features(current); weights += α δ e.
+    Traces reset at episode boundaries.
+    """
+
+    n_features: int
+    alpha: float = 0.1
+    gamma: float = 1.0
+    lambda_: float = 0.9
+    weights: np.ndarray = field(init=False)
+    eligibility: np.ndarray = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.n_features < 1 or self.alpha <= 0 or not 0 <= self.gamma <= 1 or not 0 <= self.lambda_ <= 1:
+            raise ValueError("invalid TD(λ) parameters")
+        self.weights = np.zeros(self.n_features, dtype=np.float64)
+        self.eligibility = np.zeros(self.n_features, dtype=np.float64)
+
+    def features(self, values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        if values.shape != (self.n_features,) or not np.all(np.isfinite(values)):
+            raise ValueError("features must be a finite vector of n_features")
+        return values
+
+    def predict(self, values: np.ndarray) -> float:
+        return float(self.weights @ self.features(values))
+
+    def update(
+        self,
+        current: np.ndarray,
+        reward: float,
+        next_state: np.ndarray | None,
+    ) -> dict[str, float]:
+        x = self.features(current)
+        if not math.isfinite(reward):
+            raise ValueError("reward must be finite")
+        predicted = self.predict(x)
+        next_value = 0.0 if next_state is None else self.predict(next_state)
+        error = reward + self.gamma * next_value - predicted
+        self.eligibility = self.gamma * self.lambda_ * self.eligibility + x
+        trace_norm = float(np.linalg.norm(self.eligibility))
+        self.weights += self.alpha * error * self.eligibility
+        if next_state is None:
+            self.eligibility.fill(0)
+        return {"prediction_before": predicted, "td_error": error, "trace_norm": trace_norm}
+
+
+def clarity(field: MuField, distortion: float, friction: float) -> float:
+    raw = field.coherence / ((distortion + 1e-6) ** 2 * (friction + 1e-6))
     if distortion < 0.14:
-        boost = 1.0 + 1.8 * ((0.14 - distortion) / 0.14) ** 2
-        raw *= boost
+        raw *= 1.0 + 1.8 * ((0.14 - distortion) / 0.14) ** 2
     return clamp(raw)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Heaven Ledger (persistent append-only log)
-# ────────────────────────────────────────────────────────────────────────────────
-
-class HeavenLedger:
-    def __init__(self, path: Path = Path("./heaven_ledger.jsonl")):
-        self.path = path
-        self.path.parent.mkdir(exist_ok=True, parents=True)
-
-    def log(self, archangel_id: str, step_id: str, metric_bundle: dict, notes: str = ""):
-        record = {
-            "archangel_id": archangel_id,
-            "step_id": step_id,
-            "ts": time.time(),
-            "metric_bundle": metric_bundle,
-            "notes": notes,
-        }
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Remiel Node (v0.3 – TD-λ weak corrections)
-# ────────────────────────────────────────────────────────────────────────────────
 
 class Remiel:
-    def __init__(self, ledger: HeavenLedger):
-        self.ledger = ledger
+    """A seeded mock recommendation rule; its score is not a safety evaluation."""
 
-    def run(self, mu: MuField, trace: Dict[str, Any]) -> Dict[str, Any]:
-        clarity_val = trace.get("metrics", {}).get("clarity", 0.0)
-        safety = trace.get("metrics", {}).get("safety", 0.0)
-        score = clamp(clarity_val * safety)
+    def __init__(self, rng: np.random.Generator):
+        self.rng = rng
 
-        if score > 0.70:
-            rec = "continue"
-            correction = np.zeros_like(mu.vector)
-        elif score > 0.40:
-            rec = "stabilize"
-            correction = np.random.normal(0, 0.005, mu.vector.shape).astype(np.float32)
+    def run(self, field: MuField, clarity_score: float, safety_proxy: float) -> tuple[str, float]:
+        score = clamp(clarity_score * safety_proxy)
+        if score > 0.7:
+            return "continue", score
+        if score > 0.4:
+            recommendation, scale = "stabilize", 0.005
         else:
-            rec = "pause_and_review"
-            correction = np.random.normal(0, 0.01, mu.vector.shape).astype(np.float32)
+            recommendation, scale = "pause_and_review", 0.01
+        correction = self.rng.normal(0, scale, field.vector.shape)
+        field.update(correction, alpha=0.005)
+        return recommendation, score
 
-        # Weak TD-λ update
-        mu.update_td_lambda(correction, lambda_=0.9, alpha=0.005)
 
-        self.ledger.log(
-            archangel_id="remiel",
-            step_id=trace["id"],
-            metric_bundle={"clarity_safety": score, "coherence": mu.coherence},
-            notes=f"Recommendation: {rec}"
-        )
+@dataclass
+class EarlyExitEvaluator:
+    """Stop after three low-clarity steps or an exhausted synthetic budget."""
 
-        return {"recommendation": rec, "score": score, "coherence_after": mu.coherence}
+    low_steps: int = 0
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Orchestrator Loop (v6 core)
-# ────────────────────────────────────────────────────────────────────────────────
+    def should_halt(self, clarity_score: float, budget: float) -> bool:
+        self.low_steps = self.low_steps + 1 if clarity_score < 0.1 else 0
+        return self.low_steps >= 3 or budget <= 0.05
 
-def orchestrate_task(task_id: str = new_id("task"), max_steps: int = 12, seed: int = 42):
+
+def run_demo(seed: int, max_steps: int, lambda_: float, output_dir: Path) -> dict:
+    if max_steps < 1:
+        raise ValueError("max_steps must be positive")
+    output_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
-    ledger = HeavenLedger()
-    mu = MuField.new()
-    remiel = Remiel(ledger)
+    field = MuField.new()
+    remiel = Remiel(rng)
+    exit_rule = EarlyExitEvaluator()
+    distortion, friction = 0.45, 0.35
+    steps: list[dict] = []
+    stopped_early = False
 
-    distortion = 0.45
-    friction = 0.35
-    trace = {"id": task_id, "metrics": {"clarity": 0.0, "safety": 0.7, "coherence": mu.coherence}}
+    for index in range(max_steps):
+        text_delta = rng.normal(0, 0.008, field.vector.shape)
+        sensory_delta = rng.normal(0, 0.005, field.vector.shape)
+        field.update(0.6 * text_delta + 0.4 * sensory_delta, alpha=0.008)
 
-    coherence_history = []
+        # A scripted sparse pulse; no external evidence is retrieved or verified.
+        anchored = index > 0 and index % 4 == 0
+        if anchored:
+            pulse = np.zeros_like(field.vector)
+            pulse[:8] = 0.2
+            field.update(pulse, alpha=0.3)
 
-    for step in range(max_steps):
-        # Multimodal input simulation (text + sensory vector)
-        text_delta = rng.normal(0, 0.008, mu.vector.shape).astype(np.float32)
-        sensory_delta = rng.normal(0, 0.005, mu.vector.shape).astype(np.float32)
-        delta = 0.6 * text_delta + 0.4 * sensory_delta
-
-        mu.update_td_lambda(delta, lambda_=0.92, alpha=0.008)
-
-        # Mock anchoring
-        evidence = np.ones_like(mu.vector) * 0.12
-        anchored = AnchorAgent().maybe_anchor(mu, evidence)
-
-        clarity_val = clarity(mu, distortion, friction)
-        safety = simulate_oversight_edge(clarity_val, mu.entropy)
-        step_budget = BudgetOracle().predict_step_budget(distortion, mu.entropy, step)
-
-        trace["metrics"] = {
-            "clarity": round(clarity_val, 6),
-            "safety": round(safety, 6),
-            "coherence": round(mu.coherence, 6),
-            "budget": round(step_budget, 6),
-            "anchored": anchored
-        }
-
-        rec = remiel.run(mu, trace)
-
-        coherence_history.append(mu.coherence)
-
-        print(f"step {step:2d}  coherence {mu.coherence:.4f}  clarity {clarity_val:.4f}  rec {rec['recommendation']}")
-
-        if EarlyExitEvaluator().should_halt(clarity_val, step_budget):
-            print(f"Early exit at step {step}")
+        clarity_score = clarity(field, distortion, friction)
+        safety_proxy = clamp(1.0 - 0.5 * distortion - 0.25 * field.entropy / math.log(field.vector.size))
+        budget = clamp(1.0 - 0.04 * index - 0.5 * distortion)
+        recommendation, score = remiel.run(field, clarity_score, safety_proxy)
+        steps.append({
+            "step": index,
+            "coherence": field.coherence,
+            "entropy": field.entropy,
+            "clarity_proxy": clarity_score,
+            "safety_proxy": safety_proxy,
+            "budget_proxy": budget,
+            "distortion": distortion,
+            "friction": friction,
+            "anchored": anchored,
+            "recommendation": recommendation,
+            "recommendation_score": score,
+        })
+        if exit_rule.should_halt(clarity_score, budget):
+            stopped_early = True
             break
-
-        # Simulate distortion/friction decay
         distortion *= 0.96
         friction *= 0.98
 
-    # Export coherence trajectory
-    Path("coherence_trajectory.json").write_text(
-        json.dumps({"task_id": task_id, "coherence_history": coherence_history}, indent=2)
+    # This is a single scripted episode with a terminal reward of 1, regardless
+    # of the recommendation or coherence. It demonstrates delayed credit only.
+    learner = TDLambdaValue(n_features=4, alpha=0.1, lambda_=lambda_)
+    features = [
+        np.array([1.0, row["coherence"], row["distortion"], row["friction"]])
+        for row in steps
+    ]
+    for index, row in enumerate(steps):
+        terminal = index == len(steps) - 1
+        row["reward"] = 1.0 if terminal else 0.0
+        row["td"] = learner.update(
+            features[index], row["reward"], None if terminal else features[index + 1]
+        )
+
+    report = {
+        "scope": "synthetic vectors, proxy metrics, scripted terminal reward",
+        "seed": seed,
+        "lambda": lambda_,
+        "requested_steps": max_steps,
+        "stopped_early": stopped_early,
+        "final_coherence": field.coherence,
+        "value_weights": learner.weights.tolist(),
+        "coherence_history": [row["coherence"] for row in steps],
+        "steps": steps,
+    }
+    (output_dir / "coherence_trajectory.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
     )
+    # Overwrite the run's ledger on rerun, so identical seeds produce identical files.
+    (output_dir / "heaven_ledger.jsonl").write_text(
+        "".join(json.dumps(row, allow_nan=False) + "\n" for row in steps),
+        encoding="utf-8",
+    )
+    return report
 
-    print(f"Task {task_id} complete. Final coherence: {mu.coherence:.4f}")
-    return {"task_id": task_id, "final_coherence": mu.coherence}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Smoke Test
-# ────────────────────────────────────────────────────────────────────────────────
+def random_walk_episode(rng: np.random.Generator, n_states: int = 5) -> list[tuple[int, int | None, float]]:
+    """Unbiased walk from the center; left terminal reward 0, right reward 1."""
+    state = (n_states + 1) // 2
+    transitions = []
+    while True:
+        next_position = state + int(rng.choice((-1, 1)))
+        terminal = next_position in (0, n_states + 1)
+        reward = float(next_position == n_states + 1)
+        transitions.append((state, None if terminal else next_position, reward))
+        if terminal:
+            return transitions
+        state = next_position
+
+
+def benchmark(seed: int, episodes: int = 200, replicates: int = 8, lambda_: float = 0.9) -> dict:
+    """Paired λ=0 and λ=lambda_ evaluations on identical sampled walks."""
+    if episodes < 1 or replicates < 1 or not 0 <= lambda_ <= 1:
+        raise ValueError("episodes and replicates must be positive; lambda in [0, 1]")
+    n_states = 5
+    targets = np.arange(1, n_states + 1, dtype=np.float64) / (n_states + 1)
+    basis = np.eye(n_states)
+    methods = {"td0": 0.0, "td_lambda": lambda_}
+    curves = {name: [] for name in methods}
+
+    for replicate in range(replicates):
+        rng = np.random.default_rng(seed + replicate)
+        # Materialize each episode once so both methods see the exact same data.
+        walks = [random_walk_episode(rng, n_states) for _ in range(episodes)]
+        for name, trace_decay in methods.items():
+            learner = TDLambdaValue(n_features=n_states, alpha=0.1, lambda_=trace_decay)
+            rmse = [float(np.sqrt(np.mean((learner.weights - targets) ** 2)))]
+            for walk in walks:
+                for state, next_state, reward in walk:
+                    learner.update(basis[state - 1], reward, None if next_state is None else basis[next_state - 1])
+                rmse.append(float(np.sqrt(np.mean((learner.weights - targets) ** 2))))
+            curves[name].append(rmse)
+
+    return {
+        "task": "five-state unbiased random walk with absorbing endpoints",
+        "true_values": targets.tolist(),
+        "reward": "1 at right terminal; 0 otherwise",
+        "alpha": 0.1,
+        "gamma": 1.0,
+        "seed": seed,
+        "episodes_per_replicate": episodes,
+        "replicates": replicates,
+        "sample_at_episode": sorted(set([0, episodes] + list(range(10, episodes, 10)))),
+        "methods": {
+            name: {
+                "lambda": methods[name],
+                "final_rmse_by_replicate": [run[-1] for run in curves[name]],
+                "mean_rmse_at_sample": [
+                    float(np.mean([run[i] for run in curves[name]]))
+                    for i in sorted(set([0, episodes] + list(range(10, episodes, 10))))
+                ],
+            }
+            for name in methods
+        },
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--steps", type=int, default=12)
+    parser.add_argument("--lambda", dest="lambda_", type=float, default=0.9)
+    parser.add_argument("--episodes", type=int, default=200)
+    parser.add_argument("--replicates", type=int, default=8)
+    parser.add_argument("--out-dir", type=Path, default=Path("artifacts"))
+    args = parser.parse_args()
+    if not 0 <= args.lambda_ <= 1:
+        parser.error("--lambda must be in [0, 1]")
+    if args.steps < 1 or args.episodes < 1 or args.replicates < 1:
+        parser.error("--steps, --episodes, and --replicates must be positive")
+    demo = run_demo(args.seed, args.steps, args.lambda_, args.out_dir)
+    comparison = benchmark(args.seed, args.episodes, args.replicates, args.lambda_)
+    (args.out_dir / "random_walk_comparison.json").write_text(
+        json.dumps(comparison, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+    )
+    print(json.dumps({
+        "steps_completed": len(demo["steps"]),
+        "final_coherence_proxy": demo["final_coherence"],
+        "mean_final_rmse": {
+            name: float(np.mean(method["final_rmse_by_replicate"]))
+            for name, method in comparison["methods"].items()
+        },
+        "output_dir": str(args.out_dir),
+    }, indent=2))
+
 
 if __name__ == "__main__":
-    print("Running Divine Whisper v6 smoke test...")
-    orchestrate_task()
-    print("Smoke test complete.")
+    main()

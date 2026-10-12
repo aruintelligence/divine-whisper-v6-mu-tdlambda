@@ -1,45 +1,43 @@
 > [!NOTE]
-> **Divine Whisper lineage repository.** This is a preserved experimental stage or supporting component. Start with the [canonical ecosystem index](https://github.com/aruintelligence/divine-whisper-ecosystem) for the complete version map, current context, and research-scope notice.
+> **Divine Whisper lineage repository.** This is an experimental stage. See the [ecosystem index](https://github.com/aruintelligence/divine-whisper-ecosystem) for the version map and research scope.
 
-# Divine Whisper v6 – Multimodal μ-Field + TD-λ Orchestrator
+# Divine Whisper v6: μ-field simulation and TD(λ)
 
-**First runnable prototype of explicit memory field μ(x,t) + temporal-difference (λ) learning under Inward Physics**
+This repository contains two small, reproducible experiments:
 
-**Co-Authors**  
-- Daniel Jacob Read IV (ĀRU Intelligence Inc.) – Inward Physics architecture, belief threading, coherence dynamics  
-- Shane Travis Horman – Core loop, TD-λ implementation, multimodal simulation, Remiel corrections  
+1. A **synthetic** text/sensory vector stream, a stateful μ vector, inverse-entropy concentration (called `coherence` here), scripted sparse pulses, and a mock recommendation rule. A linear TD(λ) learner receives a reward of 1 at the end of this single scripted episode. Its reward is independent of the recommendation and the concentration proxy.
+2. A **five-state random walk** with known values, used to compare online TD(0) and TD(λ) on the same sampled episodes. The unbiased walk pays 0 on the left boundary and 1 on the right; the true value for state `i` is `i/6`. Lower root mean squared error (RMSE) means closer predictions on this specific toy task.
 
-**License**: MIT  
+The original v6 script referenced undefined components and labeled a vector addition `update_td_lambda` even though it ignored λ. This version uses actual accumulating eligibility traces for a linear value function:
 
-**Keywords**: inward-physics, td-lambda, memory-field, multimodal-ai, belief-state, phase-transition, coherence-attractor, variance-collapse, self-remembering, agentic-ai, python, open-source-ai, consciousness-in-code, regret-as-force
+```text
+δ = reward + γ V(next) - V(current), with V(terminal) = 0
+e = γ λ e + features(current)
+weights = weights + α δ e
+```
 
-v6 takes the full Divine Whisper lineage and unifies it into a **single, learning memory field** that:
+The trace resets at the end of each episode. At λ=0, only the current feature receives each update. The walk benchmark uses the same seed, episodes, features, learning rate, and discount for the two methods. It reports every replicate's final error and mean learning curves; it does not choose the better run after the fact.
 
-- Explicitly models μ(x,t) as persistent vector + real-time coherence score  
-- Applies **TD(λ)** temporal-difference updates with eligibility traces  
-- Fuses **multimodal input** (text + synthetic sensory vectors)  
-- Adapts phase-aware (NOISE → BREAKTHROUGH detection)  
-- Runs **Remiel node** with weak TD corrections & safety recommendations  
-- Logs every step to **Heaven Ledger** (JSONL fallback)  
-- Exits early on negative free-energy delta  
-- Exports **coherence trajectory** (JSON) for visualization  
-- Passes smoke test + CLI entry point
-
-Run it → watch coherence rise through temporal credit assignment and multimodal remembrance.
-
-## Core Inward Physics in Code
-
-- μ-field = persistent remembrance substrate  
-- TD-λ = regret-as-force propagation across time  
-- Clarity Ψ(t) = coherence / (distortion² × friction) + nonlinear breakthrough boost  
-- Anchoring = coherence gain on strong evidence  
-- Remiel = self-observing guardian applying TD corrections  
-- Early-exit = release when inward stabilization threatened
-
-## Quick Start (30 seconds)
+## Run
 
 ```bash
-git clone https://github.com/aruintelligence/divine-whisper-v6-mu-tdlambda.git
-cd divine-whisper-v6-mu-tdlambda
-pip install numpy
-python dw_v6_mu_tdlambda.py
+python -m pip install numpy
+python divine_whisper_v6_multimodal_mu_tdlambda.py --seed 42 --steps 12 --lambda 0.9 --episodes 200 --replicates 8 --out-dir artifacts
+python -m unittest discover -s tests -v
+```
+
+The command writes:
+
+| File | Contents |
+| --- | --- |
+| `artifacts/coherence_trajectory.json` | Every synthetic step, proxies, delayed reward, TD error, eligibility norm, and final weights |
+| `artifacts/heaven_ledger.jsonl` | One JSON record per synthetic step |
+| `artifacts/random_walk_comparison.json` | Paired TD(0) and TD(λ) RMSE curves, per-replicate outcomes, true values, parameters |
+
+Running the same command with the same seed and parameters overwrites these files with the same content. To inspect sensitivity, vary `--lambda`, `--seed`, `--episodes`, and `--replicates`. An isolated λ result can fluctuate; compare across seeds and learning rates before inferring anything general.
+
+## Interpretation
+
+The benchmark tests temporal credit assignment on a known Markov chain. The vector simulation does **not** measure consciousness, safety, real multimodal understanding, phase transitions, or a general-purpose agent. Its `clarity`, `safety_proxy`, `budget_proxy`, and `coherence` fields are formulas over generated numbers. The sparse "anchor" is a scripted pulse, not verified evidence. An improvement in the random-walk RMSE is evidence of value prediction on that walk, not a breakthrough in the broader claims.
+
+Original concept and authors: Daniel Jacob Read IV and Shane Travis Horman. MIT licensed.
